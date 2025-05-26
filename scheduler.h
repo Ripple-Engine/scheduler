@@ -12,87 +12,87 @@
 #include <coroutine>
 
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>
 #include <thread>
 #include <atomic>
 
-class Scheduler {
-private:
+namespace Ripple {
 
-/**
- * @brief represents an inter-job communication channel to check for completion
- */
-class Channel {
-protected:
+class Scheduler {
+private: 
+
+struct Promise_Base {
+
+    std::shared_mutex mut;
 
     std::atomic<size_t> num_waiting_on;
+    Promise_Base* parent;
+
+    inline bool is_unblocked() const noexcept {
+        return num_waiting_on.load() == 0;
+    }
+
+    inline static Promise_Base* get(std::coroutine_handle<> handle) {
+        return static_cast<Promise_Base*>(handle.address());
+    }
+
+}; /* struct Promise_Base */
+
+class Worker {
+private:
+
+    Circular_Buffer<std::coroutine_handle<>> queue_jobs;
+
+    // TODO: special termination job to terminate the worker
+    bool flag_term;
 
 public:
 
-    Channel() :
-        num_waiting_on(0)
-    {}
+    Worker(size_t num_jobs_max);
 
-}; /* class Channel */
+    Worker(const Worker&) = delete;
+    Worker(Worker&&) = delete;
+    Worker& operator=(const Worker&) = delete;
+    Worker& operator=(Worker&&) = delete;
 
-/**
- * @brief the interface of a Channel as viewed from the owning job
- */
-class Channel_Self : public Channel {
-public:
+    void work();
 
-    void signal_spawn(size_t num_spawn) {
-        num_waiting_on += num_spawn;
-    }
+    // TODO:
+    void assign_job(std::coroutine_handle<> job);
 
-    void signal_spawn() {
-        signal_spawn(1);
-    }
+}; /* class Worker */
 
-    bool is_ready() {
-        size_t expected = 0;
+static std::vector<Worker> workers;
 
-        return num_waiting_on.compare_exchange_strong(expected, 0);
-    }
+inline static thread_local Worker* worker_this_thread$ = nullptr;
 
-}; /* class Channel_Self */
-
-/**
- * @brief the interface of a Channel as viewed from a child job
- */
-class Channel_Parent : public Channel {
-public:
-
-    void signal_done() {
-        --num_waiting_on;
-    }
-
-}; /* class Channel_Parent */
+static Worker& get_random_worker();
 
 public:
+
+static void Run(size_t num_hw_threads, size_t num_jobs_max);
+
+class Awaiter;
 
 template <typename T>
 class Job {
+    friend class Awaiter;
 private:
 
-    struct promise_type {
+    struct promise_type : public Promise_Base {
 
         // the value returned by the coroutine
-        T value;
-
-        // communication channel of the coroutine
-        Channel channel_curr;
-
-        // pointer to the channel of the parent coroutine
-        Channel* channel_parent;
+        T* value;
 
         promise_type() :
-            channel_curr(),
-            channel_parent(nullptr)
+            Promise_Base(),
+            value(nullptr)
         {}
 
         Job get_return_object() {
-            // TODO: set channel_parent here
+            value = new T();
+
             return Job{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
 
@@ -110,7 +110,8 @@ private:
 
         template <typename U>
         void return_value(U&& v) {
-            value = std::forward<U>(v);
+            std::unique_lock lock(mut);
+            *value = std::forward<U>(v);
         }
 
     }; /* struct promise_type */
@@ -121,126 +122,95 @@ private:
 
     Handle handle;
 
-    Job(Handle h) : handle(h) {}
+    T* result;
+
+    Job(Handle h) : 
+        handle(h),
+        result(handle.promise().value)
+    {
+        std::unique_lock lock(Promise_Base::get(handle)->mut);
+        worker_this_thread$->assign_job(handle);
+    }
 
 public:
 
     Job(const Job&) = delete;
 
-    Job(Job&& other) : handle(other.handle) {
+    Job(Job&& other) :
+        handle(other.handle),
+        result(other.result)
+    {
+        other.result = nullptr;
         other.handle = nullptr;
     }
 
     ~Job() {
+        std::unique_lock lock(Promise_Base::get(handle)->mut);
+
         if (handle) {
             handle.destroy();
+            handle = nullptr;
         }
+
+        delete result;
     }
 
     Job& operator=(const Job&) = delete;
 
     Job& operator=(Job&& other) {
+        std::shared_lock lock(Promise_Base::get(handle)->mut);
+
         if (this != &other) {
             handle = other.handle;
+            other.handle = nullptr;
+            result = other.result;
             other.handle = nullptr;
         }
         return *this;
     }
 
+    bool await_ready() const noexcept {
+        std::shared_lock lock(Promise_Base::get(handle)->mut);
+
+        if(handle) 
+            return handle.done();
+        else
+            return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> handle_parent) noexcept {
+        // add this job to the parent job's (the coroutine we suspended on) waiting list
+
+        // TODO: consider deadlock?
+        auto promise_base_parent$ = Promise_Base::get(handle_parent);
+        auto promise_base_child$ = Promise_Base::get(handle);
+
+        std::unique_lock lock(promise_base_parent$->mut);
+        std::unique_lock lock_child(promise_base_child$->mut);
+        
+        ++promise_base_parent$->num_waiting_on;
+        promise_base_child$->parent = promise_base_parent$;
+
+        worker_this_thread$->assign_job(handle_parent);
+    }
+
+    T await_resume() {
+        // notify the parent that we are done
+
+        auto promise_base$ = Promise_Base::get(handle);
+        std::unique_lock lock(promise_base->mut);
+
+        --promise_base$->parent->num_waiting_on;
+
+        return *result;
+    }
+
 }; /* class Job<T> */
 
-private:
+friend class Job;
 
-class Worker {
-private:
-
-    /* the current job context */
-    // TODO: where do we even set this?
-    Channel_Parent* channel_curr;
-
-    Circular_Buffer<std::coroutine_handle<>> queue_jobs;
-
-    // TODO: special termination job to terminate the worker
-    bool flag_term;
-
-public:
-
-    Worker(size_t num_jobs_max) :
-        channel_curr(nullptr),
-        queue_jobs(num_jobs_max)
-    {}
-
-    void work() {
-        while (!flag_term) {
-            auto job$ = queue_jobs.pop_and_get_front_if_possible();
-                
-            // if no jobs, then try to steal a job from another worker at random            
-            while(!job$) {
-                auto& worker = get_random_worker();
-                job$ = worker.queue_jobs.steal_if_possible();
-
-                // TODO: fix this busy wait
-                if(!job$)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-
-            auto& job = job$.value();
-
-            // process the job
-            job.resume();
-
-            if(!job.done()) {
-                // TODO: consider whether or not we can block here
-
-            }
-        }
-    }
-
-}; /* class Worker */
-
-friend class Worker;
-
-static std::vector<Worker> workers;
-
-inline static thread_local Worker* worker$ = nullptr;
-
-static Worker& get_random_worker() {
-    static thread_local std::mt19937 gen(std::random_device{}());
-    static thread_local std::uniform_int_distribution<size_t> dist(0, workers.size() - 1);
-
-    size_t idx = dist(gen);
-
-    return workers[idx];
-}
-
-public:
-
-static void Run(size_t num_hw_threads, size_t num_jobs_max) {
-
-    workers.reserve(num_hw_threads);
-
-    for(size_t i = 0; i < num_hw_threads; ++i) {
-        workers.emplace_back(num_jobs_max);
-    }
-
-    worker$ = &workers[0];
-
-    // thread pool for the workers, except the first one
-    std::vector<std::thread> threads;
-    threads.reserve(num_hw_threads - 1);
-
-    // create the worker threads
-    for(size_t i = 1; i < num_hw_threads; ++i)
-        threads.emplace_back(std::bind(&Worker::work, &workers[i]));
-
-    // run the first worker in the main thread
-    workers[0].work();
-
-    for(auto& thread : threads)
-        thread.join();
-
-}
-    
 }; /* class Scheduler */
+
+}; /* namespace Ripple */
 
 #endif /* SCHEDULER_H */

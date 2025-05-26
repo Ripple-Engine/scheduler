@@ -58,7 +58,9 @@ public:
         idx_next_empty{0}
     {}
 
-    ~Extrema_Circular_Buffer() {}
+    ~Extrema_Circular_Buffer() {
+        delete[] data;
+    }
 
     std::optional<T> pop_and_get_front_if_possible() {
         std::unique_lock<std::mutex> g0(mut_head);
