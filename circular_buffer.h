@@ -17,9 +17,10 @@ private:
 
     using Elem = std::pair<T, bool>;
 
-    Elem* data;
     size_t capacity;
     #define CAPACITY_ACTUAL (capacity + 1)
+
+    Elem* data;
 
     size_t idx_head, idx_next_empty;
 
@@ -52,11 +53,61 @@ private:
 public:
 
     Extrema_Circular_Buffer(size_t capacity) :
-        data{new Elem[CAPACITY_ACTUAL]},
         capacity{capacity},
+        data{new Elem[CAPACITY_ACTUAL]},
         idx_head{0},
         idx_next_empty{0}
     {}
+
+    Extrema_Circular_Buffer(const Extrema_Circular_Buffer& other) :
+        capacity{other.capacity},
+        data{new Elem[CAPACITY_ACTUAL]},
+        idx_head{other.idx_head},
+        idx_next_empty{other.idx_next_empty}
+    {
+        for(size_t i = 0; i < CAPACITY_ACTUAL; ++i) {
+            data[i] = other.data[i];
+        }
+    }
+
+    Extrema_Circular_Buffer(Extrema_Circular_Buffer&& other) :
+        capacity{other.capacity},
+        data{other.data},
+        idx_head{other.idx_head},
+        idx_next_empty{other.idx_next_empty},
+    {
+        other.data = nullptr; // prevent deletion in destructor
+    }
+
+    Extrema_Circular_Buffer& operator=(const Extrema_Circular_Buffer& other) {
+        if(this != &other) {
+            delete[] data;
+
+            capacity = other.capacity;
+            data = new Elem[CAPACITY_ACTUAL];
+            idx_head = other.idx_head;
+            idx_next_empty = other.idx_next_empty;
+
+            for(size_t i = 0; i < CAPACITY_ACTUAL; ++i) {
+                data[i] = other.data[i];
+            }
+        }
+        return *this;
+    }
+
+    Extrema_Circular_Buffer& operator=(Extrema_Circular_Buffer&& other) {
+        if(this != &other) {
+            delete[] data;
+
+            data = other.data;
+            capacity = other.capacity;
+            idx_head = other.idx_head;
+            idx_next_empty = other.idx_next_empty;
+
+            other.data = nullptr; // prevent deletion in destructor
+        }
+        return *this;
+    }
 
     ~Extrema_Circular_Buffer() {
         delete[] data;
@@ -127,6 +178,21 @@ public:
 
     bool insert_tail_if_possible(const T& elem, bool stickied = false) {
         return insert_tail_if_possible(T(elem), stickied);
+    }
+
+    bool empty() const {
+        std::shared_lock<std::mutex> g0(mut_head);
+        return empty_nonlocking();
+    }
+
+    bool full() const {
+        std::shared_lock<std::mutex> g0(mut_tail);
+        return full_nonlocking();
+    }
+
+    size_t size() const {
+        std::shared_lock<std::mutex> g0(mut_head);
+        return size_nonlocking();
     }
 
 }; /* class Extrema_Circular_Buffer<T> */

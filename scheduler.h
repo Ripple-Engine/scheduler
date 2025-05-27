@@ -34,7 +34,8 @@ struct Promise_Base {
     }
 
     inline static Promise_Base* get(std::coroutine_handle<> handle) {
-        return static_cast<Promise_Base*>(handle.address());
+        // TODO: what in the heebus jeebus is there a better way to do this?
+        return reinterpret_cast<Promise_Base*>(handle.address());
     }
 
 }; /* struct Promise_Base */
@@ -56,25 +57,55 @@ public:
     Worker& operator=(const Worker&) = delete;
     Worker& operator=(Worker&&) = delete;
 
-    void work();
-
     // TODO:
     void assign_job(std::coroutine_handle<> job);
 
+    void work();
+
 }; /* class Worker */
+
+// TODO: consider a better way to handle overflow jobs
+class Queue_Overflow {
+private:
+
+    mutable std::mutex mut;
+
+    using List = std::list<Circular_Buffer<std::coroutine_handle<>>>;
+
+    List queues_overflow;
+
+    size_t num_jobs_max;
+
+public:
+
+    Queue_Overflow(size_t num_jobs_max);
+
+    void assign_job(std::coroutine_handle<> job);
+
+    Circular_Buffer<std::coroutine_handle<>> get_full_or_last();
+    
+}; /* struct Queue_Overflow */
+
+static Queue_Overflow queue_overflow;
 
 static std::vector<Worker> workers;
 
 inline static thread_local Worker* worker_this_thread$ = nullptr;
 
+static void assign_overflow(std::coroutine_handle<> job);
+
 static Worker& get_random_worker();
 
 public:
 
+/**
+ * @brief Runs the scheduler with the specified number of hardware threads and maximum jobs per worker; initializes all required data structures above
+ */
 static void Run(size_t num_hw_threads, size_t num_jobs_max);
 
-class Awaiter;
-
+/**
+ * @brief user facing coroutine type that can be used to create jobs; the coroutine must return a value of type T
+ */
 template <typename T>
 class Job {
     friend class Awaiter;
@@ -191,16 +222,23 @@ public:
         ++promise_base_parent$->num_waiting_on;
         promise_base_child$->parent = promise_base_parent$;
 
-        worker_this_thread$->assign_job(handle_parent);
+        // worker_this_thread$->assign_job(handle_parent);
     }
 
     T await_resume() {
         // notify the parent that we are done
 
         auto promise_base$ = Promise_Base::get(handle);
-        std::unique_lock lock(promise_base->mut);
+        std::shared_lock lock(promise_base$->mut);
 
+        // we don't have to lock the parent since it's using a std::atomic<size_t>
         --promise_base$->parent->num_waiting_on;
+
+        // if the parent is now unblocked, then add it to the worker's job queue
+        if(promise_base$->parent->is_unblocked()) {
+            std::coroutine_handle<> handle_parent = std::coroutine_handle<>::from_address(promise_base$->parent);
+            worker_this_thread$->assign_job(handle_parent);
+        }
 
         return *result;
     }
