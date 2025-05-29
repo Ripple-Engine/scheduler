@@ -1,12 +1,13 @@
 #ifndef SCHEDULER_H
 #define SCHEDULER_H
 
+#include <cassert>
 #include <optional>
 
-#include <list>
+#include <deque>
 #include <vector>
 #include <random>
-#include "circular_buffer.h"
+#include "../lib/containers/circular_buffer.h"
 
 #include <functional>
 #include <coroutine>
@@ -29,6 +30,8 @@ struct Promise_Base {
     std::atomic<size_t> num_waiting_on;
     Promise_Base* parent;
 
+    Promise_Base();
+
     inline bool is_unblocked() const noexcept {
         return num_waiting_on.load() == 0;
     }
@@ -44,18 +47,29 @@ class Worker {
 private:
 
     Circular_Buffer<std::coroutine_handle<>> queue_jobs;
+    std::deque<std::coroutine_handle<>> queue_overflow;
 
     // TODO: special termination job to terminate the worker
     bool flag_term;
+
+    /**
+     * @brief Flushes the overflow queue to the job queue; this is called every time within the work loop
+     */
+    void flush_overflow_to_jobs();
+
+    std::coroutine_handle<> acquire_job();
 
 public:
 
     Worker(size_t num_jobs_max);
 
     Worker(const Worker&) = delete;
-    Worker(Worker&&) = delete;
+
+    Worker(Worker&&);
+
     Worker& operator=(const Worker&) = delete;
-    Worker& operator=(Worker&&) = delete;
+
+    Worker& operator=(Worker&&);
 
     // TODO:
     void assign_job(std::coroutine_handle<> job);
@@ -64,44 +78,13 @@ public:
 
 }; /* class Worker */
 
-// TODO: consider a better way to handle overflow jobs
-class Queue_Overflow {
-private:
-
-    mutable std::mutex mut;
-
-    using List = std::list<Circular_Buffer<std::coroutine_handle<>>>;
-
-    List queues_overflow;
-
-    size_t num_jobs_max;
-
-public:
-
-    Queue_Overflow(size_t num_jobs_max);
-
-    void assign_job(std::coroutine_handle<> job);
-
-    Circular_Buffer<std::coroutine_handle<>> get_full_or_last();
-    
-}; /* struct Queue_Overflow */
-
-static Queue_Overflow queue_overflow;
-
-static std::vector<Worker> workers;
+inline static std::vector<Worker> workers;
 
 inline static thread_local Worker* worker_this_thread$ = nullptr;
-
-static void assign_overflow(std::coroutine_handle<> job);
 
 static Worker& get_random_worker();
 
 public:
-
-/**
- * @brief Runs the scheduler with the specified number of hardware threads and maximum jobs per worker; initializes all required data structures above
- */
-static void Run(size_t num_hw_threads, size_t num_jobs_max);
 
 /**
  * @brief user facing coroutine type that can be used to create jobs; the coroutine must return a value of type T
@@ -109,7 +92,7 @@ static void Run(size_t num_hw_threads, size_t num_jobs_max);
 template <typename T>
 class Job {
     friend class Awaiter;
-private:
+public:
 
     struct promise_type : public Promise_Base {
 
@@ -149,6 +132,8 @@ private:
 
     friend struct promise_type;
 
+private:
+
     using Handle = std::coroutine_handle<promise_type>;
 
     Handle handle;
@@ -159,7 +144,7 @@ private:
         handle(h),
         result(handle.promise().value)
     {
-        std::unique_lock lock(Promise_Base::get(handle)->mut);
+        // std::unique_lock lock(Promise_Base::get(handle)->mut);
         worker_this_thread$->assign_job(handle);
     }
 
@@ -198,6 +183,16 @@ public:
             other.handle = nullptr;
         }
         return *this;
+    }
+
+    T get_result() {
+        assert(handle);
+
+        std::shared_lock lock(Promise_Base::get(handle)->mut);
+
+        assert(handle.done());
+
+        return *result;
     }
 
     bool await_ready() const noexcept {
@@ -245,7 +240,13 @@ public:
 
 }; /* class Job<T> */
 
+template <typename T>
 friend class Job;
+
+/**
+ * @brief Runs the scheduler with the specified number of hardware threads and maximum jobs per worker; initializes all required data structures above
+ */
+static int Run(size_t num_hw_threads, size_t num_jobs_max, Job<int> (*generator_job_god)());
 
 }; /* class Scheduler */
 
